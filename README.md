@@ -2,7 +2,7 @@
 
 个性化推荐题目的 Agent(实习面试项目):用**知识追踪**估计学生能力 → 卡在**最近发展区**选题 → 推荐。
 
-> P0(评测骨架)✅ · P1(能力估计 BKT,AUC 0.7298)✅ · P2(推荐链路 + 离线对照)✅ · P3(LLM 生成题 + 独立评审)✅
+> P0(评测骨架)✅ · P1(能力估计 BKT,AUC 0.7298)✅ · P2(推荐链路 + 离线对照)✅ · P3(LLM 生成题 + 独立评审)✅ · P4(闭环演示服务)✅
 > **增益推把平均掌握度从 0.6362(随机)提到 0.6918。**
 
 ## 冷启动(第一次跑)
@@ -125,9 +125,40 @@ fail)分开统计,拦截样例 ≥ 3 条,写入 `p3_rejected_examples.json`(**�
 - 结构化输出:所有 LLM 返回一律 `json.loads` 解析,失败重试、最终抛错,不静默吞掉。
 - 生成器 / 评审器各自持有独立 LLM 客户端,可分别注入 fake 便于测试。
 
+## P4:闭环演示(做题 → 掌握度 → 推荐)(2026-10-13)
+
+`app.py`(FastAPI)+ `web/index.html`(单文件,零构建、零 CDN,离线可用)把 P1–P3
+的链路包成一个**可交互的闭环**:学生做题 → BKT 在线更新掌握度 → 立即重推下一批题。
+
+```bash
+# 快速演示(小子集,秒级启动,适合测试/演示)
+P4_FAST=1 uv run uvicorn app:app --port 8010
+
+# 完整模型(启动时全量拟合 BKT 一次,约 80 秒;之后请求内不再重算)
+uv run uvicorn app:app --port 8010
+# 浏览器打开 http://127.0.0.1:8010
+```
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/` | 返回 `web/index.html` |
+| GET | `/api/students?limit=20` | 抽样学生(优先 test 中历史足够者) |
+| GET | `/api/students/{uid}/state` | 每个知识点掌握度 + 概览(`mean_mastery` / `n_weak`) |
+| GET | `/api/students/{uid}/recommend?k=5` | `GainStrategy` 推荐 k 道题(含难度) |
+| POST | `/api/students/{uid}/answer` | body `{problem_id, correct}` → 更新掌握度 → 返回新 state + 新推荐 |
+
+**关键设计**:
+- 模型只加载一次 —— 启动时加载清洗数据 → 拟合 BKT → 建 `QuestionPool`,全部缓存到进程内;
+  请求内**绝不重新拟合**。
+- 学生「当前掌握度」= 用其在数据中的**真实历史**逐条 `update_mastery` 递推得到。
+- 前端左侧是**掌握度热力图**(颜色深浅=掌握程度,可滚动),右侧是推荐题 + 「答对/答错」按钮;
+  点击 → `POST answer` → 热力图与推荐列表**实时刷新**;顶部下拉框切换学生。
+
 ## 目录
 
 ```
+app.py              P4 FastAPI 演示服务(启动时拟合一次,进程级缓存)
+web/index.html      P4 单文件前端(零构建、零外部 CDN)
 src/data.py         加载 + 清洗 + 统一 schema
 src/split.py        按学生时间切分(主) / 整学生切分(冷启动对照)
 src/metrics.py      AUC / ACC / Recall@k
@@ -144,4 +175,4 @@ tests/              pytest
 
 ## 测试
 
-`uv run pytest -q` → **72 passed**(原 38 + P3 新增 27 + P3-FIX 新增 7)
+`uv run pytest -q` → **83 passed**(原 72 + P4 新增 11)

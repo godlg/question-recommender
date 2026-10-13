@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>题目推荐闭环演示 · P4</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #1a2028;
+    --panel-2: #232c36;
+    --line: #2f3a46;
+    --text: #e6edf3;
+    --muted: #8b98a5;
+    --ok: #2ea043;
+    --bad: #d9534f;
+    --accent: #4c8bf5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 14px 20px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  select {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 14px;
+  }
+  main {
+    display: grid;
+    grid-template-columns: 1fr 420px;
+    gap: 16px;
+    padding: 16px 20px;
+    align-items: start;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  .panel h2 {
+    font-size: 14px;
+    margin: 0 0 12px;
+    font-weight: 600;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+  .panel h2 .meta { color: var(--muted); font-size: 12px; font-weight: 400; }
+  .heatmap {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    max-height: 70vh;
+    overflow-y: auto;
+  }
+  .cell {
+    width: 92px;
+    padding: 8px 6px;
+    border-radius: 6px;
+    font-size: 11px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    border: 1px solid rgba(255,255,255,0.06);
+  }
+  .cell .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cell .val { font-weight: 600; font-size: 13px; }
+  .rec {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    margin-bottom: 8px;
+    background: var(--panel-2);
+  }
+  .rec .info { flex: 1; min-width: 0; }
+  .rec .pid { font-weight: 600; font-size: 14px; }
+  .rec .sk { color: var(--muted); font-size: 12px; }
+  .rec button {
+    border: none;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 13px;
+    color: #fff;
+    cursor: pointer;
+  }
+  .rec button.ok { background: var(--ok); }
+  .rec button.bad { background: var(--bad); }
+  .rec button:disabled { opacity: 0.5; cursor: default; }
+  #toast {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--accent);
+    color: #fff;
+    padding: 8px 16px;
+    border-radius: 20px;
+    font-size: 13px;
+    opacity: 0;
+    transition: opacity 0.25s;
+    pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
+  .bar { height: 6px; border-radius: 3px; background: rgba(255,255,255,0.08); overflow: hidden; }
+  .bar > span { display: block; height: 100%; background: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>题目推荐闭环演示</h1>
+  <span class="sub">做题 → 掌握度更新 → 重新推荐</span>
+  <span style="flex:1"></span>
+  <label class="sub">学生</label>
+  <select id="student"></select>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>掌握度热力图 <span class="meta" id="overview"></span></h2>
+    <div class="heatmap" id="heatmap"></div>
+  </section>
+
+  <section class="panel">
+    <h2>推荐题目 <span class="meta">增益推 · 期望掌握度增益最大</span></h2>
+    <div id="recs"></div>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const S = { uid: null };
+const $ = (id) => document.getElementById(id);
+
+function toast(msg) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(t._t);
+  t._t = setTimeout(() => t.classList.remove("show"), 1400);
+}
+
+function masteryColor(m) {
+  // 掌握度越高越绿,越低越红
+  const r = Math.round(217 - (217 - 46) * m);
+  const g = Math.round(83 + (160 - 83) * m);
+  const b = Math.round(79 + (67 - 79) * m);
+  return `rgb(${r},${g},${b})`;
+}
+
+function renderState(payload) {
+  const skills = payload.skills;
+  const ov = payload.overview;
+  $("overview").textContent =
+    `平均 ${ov.mean_mastery.toFixed(3)} · 薄弱 ${ov.n_weak}/${skills.length}`;
+  const hm = $("heatmap");
+  hm.innerHTML = "";
+  for (const s of skills) {
+    const c = document.createElement("div");
+    c.className = "cell";
+    c.style.background = masteryColor(s.mastery);
+    c.innerHTML =
+      `<span class="name" title="${s.skill_name}">${s.skill_name}</span>` +
+      `<span class="val">${s.mastery.toFixed(2)}</span>` +
+      `<div class="bar"><span style="width:${(s.mastery * 100).toFixed(0)}%;background:rgba(255,255,255,.85)"></span></div>`;
+    hm.appendChild(c);
+  }
+}
+
+function renderRecs(recs) {
+  const box = $("recs");
+  box.innerHTML = "";
+  if (!recs.length) {
+    box.innerHTML = '<p class="sub">暂无可推荐题目</p>';
+    return;
+  }
+  for (const r of recs) {
+    const el = document.createElement("div");
+    el.className = "rec";
+    el.innerHTML =
+      `<div class="info">
+         <div class="pid">题目 #${r.problem_id}</div>
+         <div class="sk">${r.skill_name} · 难度 ${r.difficulty.toFixed(2)}</div>
+       </div>`;
+    const ok = document.createElement("button");
+    ok.className = "ok";
+    ok.textContent = "答对";
+    ok.onclick = () => submitAnswer(r.problem_id, true, el);
+    const bad = document.createElement("button");
+    bad.className = "bad";
+    bad.textContent = "答错";
+    bad.onclick = () => submitAnswer(r.problem_id, false, el);
+    el.appendChild(ok);
+    el.appendChild(bad);
+    box.appendChild(el);
+  }
+}
+
+async function loadStudents() {
+  const resp = await fetch("/api/students?limit=50");
+  const data = await resp.json();
+  const sel = $("student");
+  sel.innerHTML = "";
+  for (const s of data.students) {
+    const o = document.createElement("option");
+    o.value = s.user_id;
+    o.textContent = "学生 " + s.user_id;
+    sel.appendChild(o);
+  }
+  if (data.students.length) {
+    S.uid = data.students[0].user_id;
+    sel.value = S.uid;
+    await refreshAll();
+  }
+}
+
+async function loadState() {
+  const resp = await fetch(`/api/students/${S.uid}/state`);
+  renderState(await resp.json());
+}
+
+async function loadRecs() {
+  const resp = await fetch(`/api/students/${S.uid}/recommend?k=5`);
+  const data = await resp.json();
+  renderRecs(data.recommendations);
+}
+
+async function refreshAll() {
+  await loadState();
+  await loadRecs();
+}
+
+async function submitAnswer(problemId, correct, el) {
+  el.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  const resp = await fetch(`/api/students/${S.uid}/answer`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ problem_id: problemId, correct: correct }),
+  });
+  if (!resp.ok) {
+    toast("提交失败");
+    el.querySelectorAll("button").forEach((b) => (b.disabled = false));
+    return;
+  }
+  const data = await resp.json();
+  renderState(data.state);
+  renderRecs(data.recommendations);
+  toast(correct ? "答对 · 掌握度已更新" : "答错 · 掌握度已更新");
+}
+
+$("student").addEventListener("change", async (e) => {
+  S.uid = e.target.value;
+  await refreshAll();
+});
+
+loadStudents();
+</script>
+</body>
+</html>
