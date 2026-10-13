@@ -23,10 +23,11 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
+from src.bank import DEFAULT_PARAMS, Bank, BankError, load_bank, parse_upload, save_bank
 from src.bkt import BKT, BKTParams, update_mastery
 from src.data import ENCODING, find_raw, load_clean
 from src.llm_client import HttpLLM, LLMConfigError
@@ -36,6 +37,7 @@ from src.split import split_by_student_time
 
 ROOT = Path(__file__).resolve().parent
 WEB_DIR = ROOT / "web"
+BANK_PATH = ROOT / "data" / "bank.jsonl"
 
 FAST_STUDENTS = 50
 FAST_SKILLS = 30
@@ -59,6 +61,9 @@ class AppState:
     text_cache: dict[int, dict] = field(default_factory=dict)
     generator: QuestionGenerator | None = None
     generator_unavailable: bool = False
+    # P5:上传的自定义题库。非 None 时推荐/作答改用该题库(向后兼容 ASSISTments)
+    bank: Bank | None = None
+    extra_students: list[int] = field(default_factory=list)
 
     def text_of(self, pid: int) -> dict | None:
         return self.text_cache.get(int(pid))
@@ -67,6 +72,29 @@ class AppState:
         if uid not in self.mastery:
             raise KeyError(uid)
         return self.mastery[uid]
+
+    def active_pool(self) -> QuestionPool:
+        return self.bank.pool() if self.bank is not None else self.pool
+
+    def active_params(self) -> Params:
+        return self.bank.params() if self.bank is not None else self.params
+
+    def active_skill_names(self) -> dict[int, str]:
+        return self.bank.skill_names if self.bank is not None else self.skill_names
+
+    def has_student(self, uid: int) -> bool:
+        return uid in self.student_ids or uid in self.history or uid in self.mastery
+
+    def create_student(self, name: str | None = None) -> int:
+        """建一个空画像学生(所有知识点掌握度 = 默认 L0),返回新 uid。"""
+        existing = set(self.student_ids) | set(self.history)
+        uid = max(existing, default=0) + 1
+        while uid in self.mastery:
+            uid += 1
+        params = self.active_params()
+        self.mastery[uid] = {sid: prm.l0 for sid, prm in params.items()}
+        self.extra_students.append(uid)
+        return uid
 
     def ensure_state(self, uid: int) -> State:
         if uid not in self.mastery:
@@ -150,6 +178,10 @@ def build_state() -> AppState:
     )
     for uid in test_ids[:FAST_STUDENTS if fast else len(test_ids)]:
         state.ensure_state(uid)
+    # P5:启动时若已落盘题库,自动加载(不覆盖 ASSISTments 路径)
+    bank = load_bank(BANK_PATH)
+    if bank is not None:
+        state.bank = bank
     return state
 
 
@@ -257,10 +289,11 @@ def _overview(mastery: State) -> dict:
 
 def _state_payload(st: AppState, uid: int) -> dict:
     mastery = st.ensure_state(uid)
+    names = st.active_skill_names()
     rows = [
         {
             "skill_id": int(sid),
-            "skill_name": st.skill_names.get(int(sid), f"skill_{int(sid)}"),
+            "skill_name": names.get(int(sid), f"skill_{int(sid)}"),
             "mastery": float(m),
         }
         for sid, m in sorted(mastery.items())
@@ -268,36 +301,62 @@ def _state_payload(st: AppState, uid: int) -> dict:
     return {"user_id": uid, "skills": rows, "overview": _overview(mastery)}
 
 
+def _bank_text(bank: Bank, pid: int) -> dict | None:
+    """从上传题库取题干(不调 LLM)。"""
+    q = bank.question(pid)
+    if q is None:
+        return None
+    return {
+        "stem": q["stem"],
+        "options": list(q["options"]),
+        "answer": q["answer"],
+    }
+
+
 def _recommend_payload(
     st: AppState, uid: int, k: int, with_text: bool = True
 ) -> list[dict]:
     mastery = st.ensure_state(uid)
-    known_skills = [s for s in mastery if s in st.params]
-    candidates = st.pool.problems_of(known_skills)
+    pool = st.active_pool()
+    params = st.active_params()
+    names = st.active_skill_names()
+    bank = st.bank
+
+    known_skills = [s for s in mastery if s in params]
+    candidates = pool.problems_of(known_skills)
 
     def prob_fn(pids: np.ndarray) -> np.ndarray:
-        skills = np.array([st.pool.skill_lookup[int(p)] for p in pids])
-        g = np.array([st.params[int(s)].g for s in skills])
-        s_slip = np.array([st.params[int(s)].s for s in skills])
-        m = np.array([mastery.get(int(s), st.params[int(s)].l0) for s in skills])
+        skills = np.array([pool.skill_lookup[int(p)] for p in pids])
+        g = np.array([params[int(s)].g for s in skills])
+        s_slip = np.array([params[int(s)].s for s in skills])
+        m = np.array([mastery.get(int(s), params[int(s)].l0) for s in skills])
         return m * (1 - s_slip) + (1 - m) * g
 
     pids = GainStrategy().recommend(
-        st.pool, prob_fn, candidates, n=k, state=mastery, params=st.params
+        pool, prob_fn, candidates, n=k, state=mastery, params=params
     )
     out = []
     for pid in pids:
-        sid = st.pool.skill_lookup[int(pid)]
-        difficulty = float(st.pool.difficulty[
-            np.where(st.pool.problem_id == int(pid))[0][0]
+        sid = pool.skill_lookup[int(pid)]
+        difficulty = float(pool.difficulty[
+            np.where(pool.problem_id == int(pid))[0][0]
         ])
+        if bank is not None:
+            # 题库自带题干 → 不再调 LLM;with_text 参数保留但默认不起作用
+            text = _bank_text(bank, int(pid))
+        else:
+            text = _text_for(st, int(pid), int(sid), difficulty, with_text)
         out.append(
             {
+                "question_id": int(pid),
                 "problem_id": int(pid),
                 "skill_id": int(sid),
-                "skill_name": st.skill_names.get(int(sid), f"skill_{int(sid)}"),
+                "skill_name": names.get(int(sid), f"skill_{int(sid)}"),
                 "difficulty": difficulty,
-                "text": _text_for(st, int(pid), int(sid), difficulty, with_text),
+                "stem": text["stem"] if text else None,
+                "options": text["options"] if text else None,
+                "answer": text["answer"] if text else None,
+                "text": text,
             }
         )
     return out
@@ -311,17 +370,37 @@ def index() -> HTMLResponse:
     return HTMLResponse(path.read_text(encoding="utf-8"))
 
 
+class StudentIn(BaseModel):
+    name: str | None = None
+
+
+def _bank_info(bank: Bank) -> dict:
+    return {
+        "n_questions": bank.n_questions,
+        "n_skills": bank.n_skills,
+        "source_name": bank.source_name,
+    }
+
+
 @app.get("/api/students")
 def students(limit: int = Query(20, ge=1, le=500)) -> dict:
     st = get_state()
-    ids = st.student_ids[:limit]
-    return {"students": [{"user_id": uid} for uid in ids], "total": len(st.student_ids)}
+    ids = list(st.extra_students) + st.student_ids
+    return {"students": [{"user_id": uid} for uid in ids[:limit]], "total": len(ids)}
+
+
+@app.post("/api/students")
+def create_student(body: StudentIn | None = None) -> dict:
+    st = get_state()
+    name = body.name if body is not None else None
+    uid = st.create_student(name)
+    return {"user_id": uid, "name": name}
 
 
 @app.get("/api/students/{uid}/state")
 def student_state(uid: int) -> dict:
     st = get_state()
-    if uid not in st.student_ids and uid not in st.history:
+    if not st.has_student(uid):
         raise HTTPException(status_code=404, detail=f"学生 {uid} 不存在")
     return _state_payload(st, uid)
 
@@ -333,7 +412,7 @@ def recommend(
     with_text: int = Query(1),
 ) -> dict:
     st = get_state()
-    if uid not in st.student_ids and uid not in st.history:
+    if not st.has_student(uid):
         raise HTTPException(status_code=404, detail=f"学生 {uid} 不存在")
     return {
         "user_id": uid,
@@ -344,12 +423,14 @@ def recommend(
 @app.post("/api/students/{uid}/answer")
 def answer(uid: int, body: AnswerIn) -> dict:
     st = get_state()
-    if uid not in st.student_ids and uid not in st.history:
+    if not st.has_student(uid):
         raise HTTPException(status_code=404, detail=f"学生 {uid} 不存在")
-    sid = st.pool.skill_lookup.get(int(body.problem_id))
+    pool = st.active_pool()
+    params = st.active_params()
+    sid = pool.skill_lookup.get(int(body.problem_id))
     if sid is None:
         raise HTTPException(status_code=404, detail=f"题目 {body.problem_id} 不存在")
-    prm: BKTParams | None = st.params.get(sid)
+    prm: BKTParams | None = params.get(sid)
     if prm is None:
         raise HTTPException(status_code=404, detail=f"知识点 {sid} 无 BKT 参数")
 
@@ -361,3 +442,47 @@ def answer(uid: int, body: AnswerIn) -> dict:
         "state": _state_payload(st, uid),
         "recommendations": _recommend_payload(st, uid, 5),
     }
+
+
+@app.post("/api/bank/upload")
+async def upload_bank(file: UploadFile = File(...)) -> dict:
+    st = get_state()
+    content = await file.read()
+    try:
+        bank = parse_upload(file.filename, content)
+        if bank.n_questions == 0:
+            raise BankError("没有解析到任何有效题目(检查必需列与坏行)")
+    except BankError as exc:
+        # 解析失败不得破坏已有题库
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    save_bank(bank, BANK_PATH)
+    st.bank = bank
+    return _bank_info(bank) | {"n_skipped": bank.n_skipped}
+
+
+@app.get("/api/bank")
+def bank_info() -> dict:
+    st = get_state()
+    if st.bank is None:
+        return {"n_questions": 0, "n_skills": 0, "source_name": None}
+    return _bank_info(st.bank)
+
+
+@app.get("/api/bank/sample")
+def bank_sample(n: int = Query(5, ge=1, le=100)) -> dict:
+    st = get_state()
+    if st.bank is None:
+        return {"questions": []}
+    out = []
+    for q in st.bank.questions[:n]:
+        out.append(
+            {
+                "question_id": q["question_id"],
+                "stem": q["stem"],
+                "options": q["options"],
+                "answer": q["answer"],
+                "skill": q["skill"],
+                "difficulty": q["difficulty"],
+            }
+        )
+    return {"questions": out}

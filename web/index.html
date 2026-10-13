@@ -133,6 +133,32 @@
   #toast.show { opacity: 1; }
   .bar { height: 6px; border-radius: 3px; background: rgba(255,255,255,0.08); overflow: hidden; }
   .bar > span { display: block; height: 100%; background: var(--accent); }
+  .bank {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding: 12px 20px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  .bank label { font-size: 13px; color: var(--muted); }
+  .bank input[type="file"] { font-size: 13px; color: var(--muted); max-width: 260px; }
+  .bank button, .btn {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .bank button:disabled { opacity: 0.5; cursor: default; }
+  .bank .stat { font-size: 13px; color: var(--text); }
+  .bank .stat b { color: var(--accent); }
+  .bank .msg { font-size: 12px; }
+  .bank .msg.ok { color: var(--ok); }
+  .bank .msg.bad { color: var(--bad); }
 </style>
 </head>
 <body>
@@ -140,9 +166,18 @@
   <h1>题目推荐闭环演示</h1>
   <span class="sub">做题 → 掌握度更新 → 重新推荐</span>
   <span style="flex:1"></span>
+  <button class="btn" id="newStudent">+ 新建学生</button>
   <label class="sub">学生</label>
   <select id="student"></select>
 </header>
+
+<div class="bank">
+  <label>题库(CSV / Excel):</label>
+  <input type="file" id="bankFile" accept=".csv,.xlsx,.xls">
+  <button id="uploadBank">上传题库</button>
+  <span class="stat" id="bankStat"></span>
+  <span class="msg" id="bankMsg"></span>
+</div>
 
 <main>
   <section class="panel">
@@ -207,14 +242,14 @@ function renderText(text) {
   if (!text) {
     return '<div class="placeholder">题面不可用</div>';
   }
-  const opts = text.options
+  const opts = (text.options || [])
     .map((o) => {
       const cls = o === text.answer ? "answer" : "";
       return `<li class="${cls}">${esc(o)}</li>`;
     })
     .join("");
   return `<div class="stem">${esc(text.stem)}</div>` +
-    `<ul class="options">${opts}</ul>`;
+    (opts ? `<ul class="options">${opts}</ul>` : "");
 }
 
 function renderRecs(recs) {
@@ -225,24 +260,28 @@ function renderRecs(recs) {
     return;
   }
   for (const r of recs) {
+    // 题库自带的题干/选项直接展示;无题库时回退到 text(LLM)
+    const text = r.stem != null
+      ? { stem: r.stem, options: r.options, answer: r.answer }
+      : r.text;
     const el = document.createElement("div");
     el.className = "rec";
     el.innerHTML =
       `<div class="info">
-         <div class="pid">题目 #${r.problem_id}</div>
+         <div class="pid">题目 #${r.question_id ?? r.problem_id}</div>
          <div class="sk">${esc(r.skill_name)} · 难度 ${r.difficulty.toFixed(2)}</div>
-         ${renderText(r.text)}
+         ${renderText(text)}
        </div>`;
     const actions = document.createElement("div");
     actions.className = "actions";
     const ok = document.createElement("button");
     ok.className = "ok";
     ok.textContent = "答对";
-    ok.onclick = () => submitAnswer(r.problem_id, true, el);
+    ok.onclick = () => submitAnswer(r.question_id ?? r.problem_id, true, el);
     const bad = document.createElement("button");
     bad.className = "bad";
     bad.textContent = "答错";
-    bad.onclick = () => submitAnswer(r.problem_id, false, el);
+    bad.onclick = () => submitAnswer(r.question_id ?? r.problem_id, false, el);
     actions.appendChild(ok);
     actions.appendChild(bad);
     el.appendChild(actions);
@@ -250,21 +289,82 @@ function renderRecs(recs) {
   }
 }
 
-async function loadStudents() {
-  const resp = await fetch("/api/students?limit=50");
-  const data = await resp.json();
+function renderStudents(students) {
   const sel = $("student");
   sel.innerHTML = "";
-  for (const s of data.students) {
+  for (const s of students) {
     const o = document.createElement("option");
     o.value = s.user_id;
     o.textContent = "学生 " + s.user_id;
     sel.appendChild(o);
   }
+}
+
+async function loadStudents() {
+  const resp = await fetch("/api/students?limit=50");
+  const data = await resp.json();
+  renderStudents(data.students);
   if (data.students.length) {
     S.uid = data.students[0].user_id;
-    sel.value = S.uid;
+    $("student").value = S.uid;
     await refreshAll();
+  }
+}
+
+async function createStudent() {
+  const resp = await fetch("/api/students", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  if (!resp.ok) { toast("新建学生失败"); return; }
+  const data = await resp.json();
+  const list = await (await fetch("/api/students?limit=50")).json();
+  renderStudents(list.students);
+  S.uid = data.user_id;
+  $("student").value = S.uid;
+  await refreshAll();
+  toast("已新建学生 " + data.user_id);
+}
+
+async function loadBankInfo() {
+  const data = await (await fetch("/api/bank")).json();
+  const el = $("bankStat");
+  if (!data.n_questions) {
+    el.innerHTML = "未上传题库(当前用 ASSISTments 数据)";
+  } else {
+    el.innerHTML =
+      `题目 <b>${data.n_questions}</b> · 知识点 <b>${data.n_skills}</b> · ${esc(data.source_name || "")}`;
+  }
+}
+
+async function uploadBank() {
+  const input = $("bankFile");
+  const msg = $("bankMsg");
+  if (!input.files.length) { toast("请先选择文件"); return; }
+  const btn = $("uploadBank");
+  btn.disabled = true;
+  msg.className = "msg";
+  msg.textContent = "上传中…";
+  const form = new FormData();
+  form.append("file", input.files[0]);
+  try {
+    const resp = await fetch("/api/bank/upload", { method: "POST", body: form });
+    const data = await resp.json();
+    if (!resp.ok) {
+      msg.className = "msg bad";
+      msg.textContent = "上传失败:" + (data.detail || "未知错误");
+      return;
+    }
+    msg.className = "msg ok";
+    msg.textContent = `上传成功(跳过 ${data.n_skipped ?? 0} 条坏行)`;
+    await loadBankInfo();
+    await refreshAll();
+  } catch (e) {
+    msg.className = "msg bad";
+    msg.textContent = "上传失败:" + e;
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -309,7 +409,13 @@ $("student").addEventListener("change", async (e) => {
   await refreshAll();
 });
 
-loadStudents();
+$("newStudent").addEventListener("click", createStudent);
+$("uploadBank").addEventListener("click", uploadBank);
+
+(async () => {
+  await loadBankInfo();
+  await loadStudents();
+})();
 </script>
 </body>
 </html>
