@@ -2,7 +2,7 @@
 
 个性化推荐题目的 Agent(实习面试项目):用**知识追踪**估计学生能力 → 卡在**最近发展区**选题 → 推荐。
 
-> P0(评测骨架)✅ · P1(能力估计 BKT,AUC 0.7298)✅ · P2(推荐链路 + 离线对照)✅ · P3(LLM 生成题 + 独立评审)✅ · P4(闭环演示服务)✅
+> P0(评测骨架)✅ · P1(能力估计 BKT,AUC 0.7298)✅ · P2(推荐链路 + 离线对照)✅ · P3(LLM 生成题 + 独立评审)✅ · P4(闭环演示服务)✅ · P5(题库上传 + 按学生推荐)✅ · P6(错题讲解 RAG)✅
 > **增益推把平均掌握度从 0.6362(随机)提到 0.6918。**
 
 ## 冷启动(第一次跑)
@@ -146,6 +146,9 @@ uv run uvicorn app:app --port 8010
 | GET | `/api/students/{uid}/state` | 每个知识点掌握度 + 概览(`mean_mastery` / `n_weak`) |
 | GET | `/api/students/{uid}/recommend?k=5` | `GainStrategy` 推荐 k 道题(含难度) |
 | POST | `/api/students/{uid}/answer` | body `{problem_id, correct}` → 更新掌握度 → 返回新 state + 新推荐 |
+| POST | `/api/materials/upload` | multipart 上传 md/txt 讲解材料 → 入库 → `{n_chunks, skills, files}` |
+| GET | `/api/materials` | 材料库概况 `{n_chunks, skills, files}` |
+| POST | `/api/students/{uid}/explain` | body `{problem_id, student_answer}` → `{explanation, sources, grounded, error}` |
 
 **关键设计**:
 - 模型只加载一次 —— 启动时加载清洗数据 → 拟合 BKT → 建 `QuestionPool`,全部缓存到进程内;
@@ -153,6 +156,48 @@ uv run uvicorn app:app --port 8010
 - 学生「当前掌握度」= 用其在数据中的**真实历史**逐条 `update_mastery` 递推得到。
 - 前端左侧是**掌握度热力图**(颜色深浅=掌握程度,可滚动),右侧是推荐题 + 「答对/答错」按钮;
   点击 → `POST answer` → 热力图与推荐列表**实时刷新**;顶部下拉框切换学生。
+
+## P6:错题讲解(RAG)(2026-10-13)
+
+学生答错题 → **检索该知识点的讲解材料** → LLM 生成**有依据的**中文讲解。
+链路:`题目 stem + skill` 构造 query → `Retriever` 检索材料 chunk → 拼进 prompt
+→ LLM 生成讲解,并回传 `sources`(知识点 / 文件 / 片段 / 分数)与 `grounded` 标记。
+
+### 材料格式与上传
+
+- 支持 `.md` / `.txt`;
+- **按 Markdown 二级标题 `## 标题` 切 chunk,标题即知识点名**(与题库 `skill` 字段对齐);
+- 没有 `##` 的纯文本 → 整个文件作为 1 个 chunk,知识点名取**文件名(去扩展名)**;
+- 落盘:`data/materials/<原文件名>`(保留原文)+ `data/materials_index.json`(chunk 索引)。
+
+```bash
+# 前端:顶部「讲解材料」栏选择 data/sample_materials/数学知识点讲解.md → 上传材料
+# 或直接调接口:
+curl -F "file=@data/sample_materials/数学知识点讲解.md" \
+  http://127.0.0.1:8010/api/materials/upload
+curl http://127.0.0.1:8010/api/materials     # → 5 个 chunk / 5 个知识点
+```
+
+内置样例材料 `data/sample_materials/数学知识点讲解.md` 含 5 节
+(一元一次方程 / 分数运算 / 几何周长 / 概率初步 / 百分数应用),与
+`data/sample_bank.csv` 的知识点**完全对齐**。
+
+### 检索为什么默认用词法而不是向量
+
+- **精确条件优先,词法/语义只用于排序**:推荐链路与本任务同一思路 —— 先用
+  `skill` 做**知识点精确过滤**(`一元一次方程` 的题绝不命中 `分数运算` 的材料),
+  再在**同一知识点内**用 `jieba` 分词 + `rank_bm25` 做词法排序。知识点是结构化精确
+  条件,用向量相似度反而会串知识点。
+- **零向量库、零模型下载**:`jieba` + `rank_bm25` 是纯本地轻量依赖;材料是中文短节,
+  词法(尤其术语如「通分」「移项」)已足够区分。向量检索的价值在语义改写/同义表达,
+  当前材料与题库术语高度一致,收益有限。
+- **可插拔**:`Retriever` 是协议,`KeywordRetriever` 只是默认实现;换成
+  `VectorRetriever`(先 `skill` 过滤再用 embedding 余弦排序)即可,返回结构一致,
+  `Explainer` 与接口无需改动。
+
+```bash
+uv run pytest tests/test_materials.py tests/test_explainer.py -q   # P6 共 35 用例
+```
 
 ## 目录
 
@@ -169,10 +214,14 @@ src/simulator.py    离线模拟学习者(带局限声明)
 src/llm_client.py   LLM 薄封装(HttpLLM / FakeLLM,耗时 + token 估算)
 src/question_gen.py 知识点上下文(RAG)+ 变式题生成
 src/reviewer.py     独立评审 agent
+src/materials.py    P6 讲解材料库(上传 / 按 ## 切分 / 落盘)
+src/retriever.py    P6 材料检索(可插拔;jieba + rank_bm25 默认实现)
+src/explainer.py    P6 检索式错题讲解(命中材料 → grounded 生成)
+data/sample_materials/数学知识点讲解.md  P6 样例材料(5 节,与样例题库对齐)
 scripts/            可执行脚本
 tests/              pytest
 ```
 
 ## 测试
 
-`uv run pytest -q` → **83 passed**(原 72 + P4 新增 11)
+`uv run pytest -q` → **147 passed**(原 112 + P6 新增 35)

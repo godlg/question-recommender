@@ -159,6 +159,29 @@
   .bank .msg { font-size: 12px; }
   .bank .msg.ok { color: var(--ok); }
   .bank .msg.bad { color: var(--bad); }
+  .explain {
+    margin-top: 8px;
+    padding: 10px 12px;
+    border-left: 3px solid var(--accent);
+    background: rgba(76,139,245,0.08);
+    border-radius: 6px;
+    font-size: 13px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+  }
+  .explain .src-title { color: var(--muted); font-size: 12px; margin-top: 8px; font-weight: 600; }
+  .explain .src {
+    font-size: 12px;
+    color: var(--muted);
+    border-top: 1px dashed var(--line);
+    padding: 4px 0;
+  }
+  .explain .src b { color: var(--text); }
+  .rec button.ghost {
+    background: transparent;
+    border: 1px solid var(--line);
+    color: var(--text);
+  }
 </style>
 </head>
 <body>
@@ -177,6 +200,14 @@
   <button id="uploadBank">上传题库</button>
   <span class="stat" id="bankStat"></span>
   <span class="msg" id="bankMsg"></span>
+</div>
+
+<div class="bank">
+  <label>讲解材料(Markdown / 纯文本):</label>
+  <input type="file" id="matFile" accept=".md,.txt">
+  <button id="uploadMat">上传材料</button>
+  <span class="stat" id="matStat"></span>
+  <span class="msg" id="matMsg"></span>
 </div>
 
 <main>
@@ -271,6 +302,7 @@ function renderRecs(recs) {
          <div class="pid">题目 #${r.question_id ?? r.problem_id}</div>
          <div class="sk">${esc(r.skill_name)} · 难度 ${r.difficulty.toFixed(2)}</div>
          ${renderText(text)}
+         <div class="explain" style="display:none"></div>
        </div>`;
     const actions = document.createElement("div");
     actions.className = "actions";
@@ -282,8 +314,13 @@ function renderRecs(recs) {
     bad.className = "bad";
     bad.textContent = "答错";
     bad.onclick = () => submitAnswer(r.question_id ?? r.problem_id, false, el);
+    const explainBtn = document.createElement("button");
+    explainBtn.className = "ghost";
+    explainBtn.textContent = "看讲解";
+    explainBtn.onclick = () => loadExplanation(r.question_id ?? r.problem_id, el, explainBtn);
     actions.appendChild(ok);
     actions.appendChild(bad);
+    actions.appendChild(explainBtn);
     el.appendChild(actions);
     box.appendChild(el);
   }
@@ -338,6 +375,46 @@ async function loadBankInfo() {
   }
 }
 
+async function loadMaterialsInfo() {
+  const data = await (await fetch("/api/materials")).json();
+  const el = $("matStat");
+  if (!data.n_chunks) {
+    el.innerHTML = "未上传讲解材料";
+  } else {
+    el.innerHTML =
+      `片段 <b>${data.n_chunks}</b> · 知识点 <b>${data.skills.length}</b> · ${esc(data.files.join("、"))}`;
+  }
+}
+
+async function uploadMaterials() {
+  const input = $("matFile");
+  const msg = $("matMsg");
+  if (!input.files.length) { toast("请先选择材料文件"); return; }
+  const btn = $("uploadMat");
+  btn.disabled = true;
+  msg.className = "msg";
+  msg.textContent = "上传中…";
+  const form = new FormData();
+  form.append("file", input.files[0]);
+  try {
+    const resp = await fetch("/api/materials/upload", { method: "POST", body: form });
+    const data = await resp.json();
+    if (!resp.ok) {
+      msg.className = "msg bad";
+      msg.textContent = "上传失败:" + (data.detail || "未知错误");
+      return;
+    }
+    msg.className = "msg ok";
+    msg.textContent = `上传成功(${data.n_chunks} 片段 / ${data.skills.length} 知识点)`;
+    await loadMaterialsInfo();
+  } catch (e) {
+    msg.className = "msg bad";
+    msg.textContent = "上传失败:" + e;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function uploadBank() {
   const input = $("bankFile");
   const msg = $("bankMsg");
@@ -386,6 +463,46 @@ async function refreshAll() {
   await loadRecs();
 }
 
+async function loadExplanation(problemId, el, btn) {
+  const box = el.querySelector(".explain");
+  box.style.display = "block";
+  box.textContent = "正在检索材料并生成讲解…";
+  btn.disabled = true;
+  try {
+    const resp = await fetch(`/api/students/${S.uid}/explain`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ problem_id: problemId, student_answer: null }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      box.textContent = "讲解失败:" + (data.detail || "未知错误");
+      return;
+    }
+    let html = "";
+    if (data.explanation) {
+      html += esc(data.explanation);
+    } else {
+      html += `<span class="placeholder">暂无讲解(${esc(data.error || "LLM 未配置")})</span>`;
+    }
+    const srcs = data.sources || [];
+    if (srcs.length) {
+      html += `<div class="src-title">引用来源(${srcs.length} 处 · grounded=${data.grounded})</div>`;
+      for (const s of srcs) {
+        html += `<div class="src">知识点:<b>${esc(s.skill)}</b> · 文件:${esc(s.file)}` +
+          `<br>片段:${esc(s.snippet)}…</div>`;
+      }
+    } else {
+      html += `<div class="src-title">未检索到材料(grounded=false,纯生成)</div>`;
+    }
+    box.innerHTML = html;
+  } catch (e) {
+    box.textContent = "讲解失败:" + e;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function submitAnswer(problemId, correct, el) {
   el.querySelectorAll("button").forEach((b) => (b.disabled = true));
   const resp = await fetch(`/api/students/${S.uid}/answer`, {
@@ -411,9 +528,11 @@ $("student").addEventListener("change", async (e) => {
 
 $("newStudent").addEventListener("click", createStudent);
 $("uploadBank").addEventListener("click", uploadBank);
+$("uploadMat").addEventListener("click", uploadMaterials);
 
 (async () => {
   await loadBankInfo();
+  await loadMaterialsInfo();
   await loadStudents();
 })();
 </script>

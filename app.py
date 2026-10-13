@@ -30,7 +30,9 @@ from pydantic import BaseModel
 from src.bank import DEFAULT_PARAMS, Bank, BankError, load_bank, parse_upload, save_bank
 from src.bkt import BKT, BKTParams, update_mastery
 from src.data import ENCODING, find_raw, load_clean
+from src.explainer import Explainer
 from src.llm_client import HttpLLM, LLMConfigError
+from src.materials import MaterialError, MaterialStore
 from src.question_gen import QuestionGenerator, parse_questions
 from src.recommender import GainStrategy, Params, QuestionPool, State
 from src.split import split_by_student_time
@@ -38,6 +40,8 @@ from src.split import split_by_student_time
 ROOT = Path(__file__).resolve().parent
 WEB_DIR = ROOT / "web"
 BANK_PATH = ROOT / "data" / "bank.jsonl"
+MATERIALS_DIR = ROOT / "data" / "materials"
+MATERIALS_INDEX = ROOT / "data" / "materials_index.json"
 
 FAST_STUDENTS = 50
 FAST_SKILLS = 30
@@ -64,6 +68,16 @@ class AppState:
     # P5:上传的自定义题库。非 None 时推荐/作答改用该题库(向后兼容 ASSISTments)
     bank: Bank | None = None
     extra_students: list[int] = field(default_factory=list)
+    # P6:讲解材料库 + 检索式讲解器(惰性初始化)
+    materials: MaterialStore | None = None
+    explainer: Explainer | None = None
+    explainer_unavailable: bool = False
+
+    def material_store(self) -> MaterialStore:
+        if self.materials is None:
+            self.materials = MaterialStore(MATERIALS_DIR, MATERIALS_INDEX)
+            self.materials.load_all()
+        return self.materials
 
     def text_of(self, pid: int) -> dict | None:
         return self.text_cache.get(int(pid))
@@ -313,6 +327,48 @@ def _bank_text(bank: Bank, pid: int) -> dict | None:
     }
 
 
+def _question_for(st: AppState, pid: int) -> dict:
+    """构造讲解用题目 dict(stem / options / answer / skill)。"""
+    pool = st.active_pool()
+    sid = pool.skill_lookup.get(int(pid))
+    names = st.active_skill_names()
+    skill = names.get(int(sid), f"skill_{int(sid)}") if sid is not None else ""
+    text = None
+    if st.bank is not None:
+        text = _bank_text(st.bank, int(pid))
+    if text is None:
+        text = st.text_of(pid) or {}
+    return {
+        "problem_id": int(pid),
+        "stem": text.get("stem"),
+        "options": text.get("options"),
+        "answer": text.get("answer"),
+        "skill": skill,
+    }
+
+
+def _ensure_explainer(st: AppState) -> Explainer:
+    """惰性建讲解器。无 LLM 配置时仍建(用于检索),llm=None 会降级为无讲解文本。"""
+    if st.explainer is not None:
+        return st.explainer
+    if st.explainer_unavailable:
+        llm = None
+    else:
+        try:
+            llm = HttpLLM()
+        except LLMConfigError:
+            st.explainer_unavailable = True
+            llm = None
+    store = st.material_store()
+    st.explainer = Explainer(llm, chunks=store.chunks)
+    return st.explainer
+
+
+def _materials_info(store: MaterialStore) -> dict:
+    return store.summary()
+
+
+
 def _recommend_payload(
     st: AppState, uid: int, k: int, with_text: bool = True
 ) -> list[dict]:
@@ -486,3 +542,50 @@ def bank_sample(n: int = Query(5, ge=1, le=100)) -> dict:
             }
         )
     return {"questions": out}
+
+
+@app.post("/api/materials/upload")
+async def upload_materials(file: UploadFile = File(...)) -> dict:
+    st = get_state()
+    store = st.material_store()
+    content = await file.read()
+    try:
+        store.add_from_bytes(file.filename or "", content)
+    except MaterialError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    store.save()
+    # 材料更新后,让讲解器看到最新 chunk
+    if st.explainer is not None:
+        st.explainer.set_chunks(store.chunks)
+    return store.summary()
+
+
+@app.get("/api/materials")
+def materials_info() -> dict:
+    return get_state().material_store().summary()
+
+
+class ExplainIn(BaseModel):
+    problem_id: int
+    student_answer: str | None = None
+
+
+@app.post("/api/students/{uid}/explain")
+def explain(uid: int, body: ExplainIn) -> dict:
+    st = get_state()
+    if not st.has_student(uid):
+        raise HTTPException(status_code=404, detail=f"学生 {uid} 不存在")
+    pool = st.active_pool()
+    if int(body.problem_id) not in pool.skill_lookup:
+        raise HTTPException(status_code=404, detail=f"题目 {body.problem_id} 不存在")
+    question = _question_for(st, int(body.problem_id))
+    explainer = _ensure_explainer(st)
+    result = explainer.explain(question, body.student_answer)
+    return {
+        "problem_id": int(body.problem_id),
+        "skill": question["skill"],
+        "explanation": result["explanation"],
+        "sources": result["sources"],
+        "grounded": result["grounded"],
+        "error": result["error"],
+    }
