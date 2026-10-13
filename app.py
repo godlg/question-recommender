@@ -30,11 +30,13 @@ from pydantic import BaseModel
 from src.bank import DEFAULT_PARAMS, Bank, BankError, load_bank, parse_upload, save_bank
 from src.bkt import BKT, BKTParams, update_mastery
 from src.data import ENCODING, find_raw, load_clean
+from src.embedder import Embedder, get_embedder
 from src.explainer import Explainer
 from src.llm_client import HttpLLM, LLMConfigError
 from src.materials import MaterialError, MaterialStore
 from src.question_gen import QuestionGenerator, parse_questions
 from src.recommender import GainStrategy, Params, QuestionPool, State
+from src.retriever import build_retriever, resolve_mode
 from src.split import split_by_student_time
 
 ROOT = Path(__file__).resolve().parent
@@ -72,12 +74,22 @@ class AppState:
     materials: MaterialStore | None = None
     explainer: Explainer | None = None
     explainer_unavailable: bool = False
+    # P7:embedding 检索(默认 None → 全程 keyword,行为与 P6 一致)
+    embedder: Embedder | None = None
+    retrieval_mode: str = "keyword"  # 实际生效模式(embedder 缺失时已降级)
 
     def material_store(self) -> MaterialStore:
         if self.materials is None:
-            self.materials = MaterialStore(MATERIALS_DIR, MATERIALS_INDEX)
+            self.materials = MaterialStore(
+                MATERIALS_DIR, MATERIALS_INDEX, embedder=self.embedder
+            )
             self.materials.load_all()
         return self.materials
+
+    def retriever(self):
+        """按实际生效模式构造检索器(embedder 为 None 时固定 keyword)。"""
+        retriever, _ = build_retriever(self.retrieval_mode, self.embedder)
+        return retriever
 
     def text_of(self, pid: int) -> dict | None:
         return self.text_cache.get(int(pid))
@@ -190,6 +202,9 @@ def build_state() -> AppState:
         history=all_history,
         student_ids=test_ids,
     )
+    # P7:embedding 可选启用;未配置 / 初始化失败 → None(全程 keyword)
+    state.embedder = get_embedder()
+    state.retrieval_mode = resolve_mode(None, state.embedder)
     for uid in test_ids[:FAST_STUDENTS if fast else len(test_ids)]:
         state.ensure_state(uid)
     # P5:启动时若已落盘题库,自动加载(不覆盖 ASSISTments 路径)
@@ -562,7 +577,12 @@ async def upload_materials(file: UploadFile = File(...)) -> dict:
 
 @app.get("/api/materials")
 def materials_info() -> dict:
-    return get_state().material_store().summary()
+    st = get_state()
+    return {
+        **st.material_store().summary(),
+        "retrieval_mode": st.retrieval_mode,
+        "embedder": st.embedder.name if st.embedder else None,
+    }
 
 
 class ExplainIn(BaseModel):

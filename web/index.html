@@ -375,14 +375,19 @@ async function loadBankInfo() {
   }
 }
 
+const MODE_LABEL = { keyword: "词法检索", vector: "向量检索", hybrid: "混合检索" };
+
 async function loadMaterialsInfo() {
   const data = await (await fetch("/api/materials")).json();
   const el = $("matStat");
+  const mode = data.retrieval_mode || "keyword";
+  const embed = data.embedder ? esc(data.embedder) : "未配向量";
+  const modeTag = `<span class="meta">[${MODE_LABEL[mode] || mode} · ${embed}]</span>`;
   if (!data.n_chunks) {
-    el.innerHTML = "未上传讲解材料";
+    el.innerHTML = `未上传讲解材料 &nbsp;${modeTag}`;
   } else {
     el.innerHTML =
-      `片段 <b>${data.n_chunks}</b> · 知识点 <b>${data.skills.length}</b> · ${esc(data.files.join("、"))}`;
+      `片段 <b>${data.n_chunks}</b> · 知识点 <b>${data.skills.length}</b> · ${esc(data.files.join("、"))} &nbsp;${modeTag}`;
   }
 }
 

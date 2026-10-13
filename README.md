@@ -199,6 +199,39 @@ curl http://127.0.0.1:8010/api/materials     # → 5 个 chunk / 5 个知识点
 uv run pytest tests/test_materials.py tests/test_explainer.py -q   # P6 共 35 用例
 ```
 
+## P7:向量语义检索(embedding 可插拔)(2026-10-13)
+
+P6 的检索 = **知识点精确过滤 + BM25 词法排序** —— 材料**按知识点组织**时才有效。
+材料没组织(长文 / 照片 OCR 出来的文本)时过滤失效,只能靠**语义相似度** → 这时才需要向量。
+
+模式由 `RETRIEVAL_MODE` 决定:`keyword`(**默认**)/ `vector` / `hybrid`(RRF 融合两路)。
+**embedder 未配置时 `vector` / `hybrid` 自动降级回 `keyword`** —— 不报错、不 500。
+
+### 两种 embedding 配法(二选一)
+
+```bash
+# A. OpenAI 兼容端点(最省事)
+export EMBED_PROVIDER=openai
+export EMBED_BASE_URL=https://your-endpoint/v1
+export EMBED_MODEL=your-embedding-model
+export EMBED_API_KEY=sk-...
+
+# B. 本地 ONNX 模型(离线;目录内需有 model.onnx + tokenizer.json)
+export EMBED_PROVIDER=onnx
+export EMBED_ONNX_DIR=/path/to/model-dir
+```
+
+- B 只用 `onnxruntime` + `tokenizers`,**不依赖 torch / transformers / sentence-transformers**。
+- **不配任何模型**(默认)→ 照旧走词法检索,系统完全正常。
+- 想只验证链路:`EMBED_PROVIDER=fake`(词袋假向量,零外部依赖)。
+
+### 检索策略
+
+| 材料形态 | 行为 |
+|---|---|
+| chunk 有知识点标签 | 先按知识点**精确过滤**,再在候选内排序 |
+| chunk **无**标签(没按知识点组织) | **全库检索** ← 向量模式的价值所在 |
+
 ## 目录
 
 ```
