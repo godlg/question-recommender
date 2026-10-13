@@ -2,7 +2,7 @@
 
 个性化推荐题目的 Agent(实习面试项目):用**知识追踪**估计学生能力 → 卡在**最近发展区**选题 → 推荐。
 
-> P0(评测骨架)✅ · P1(能力估计 BKT,AUC 0.7298)✅ · P2(推荐链路 + 离线对照)✅
+> P0(评测骨架)✅ · P1(能力估计 BKT,AUC 0.7298)✅ · P2(推荐链路 + 离线对照)✅ · P3(LLM 生成题 + 独立评审)✅
 > **增益推把平均掌握度从 0.6362(随机)提到 0.6918。**
 
 ## 冷启动(第一次跑)
@@ -81,6 +81,50 @@ ZPD推(难度匹配)   0.6260     0.6077     0.5502
 - `ZPD推` 挑预测正确率最接近 0.7 的题 —— **朴素实现会跑偏**:它被"已经中等掌握"的题吸引,绕开真正薄弱的知识点
 - `增益推` **最大化期望掌握度增益** `E[Δm] = p(对)·Δm(对) + p(错)·Δm(错)` —— 把「该练什么」形式化
 
+## P3:LLM 生成变式题 + 独立评审(2026-10-13)
+
+全项目**唯一真正需要 RAG 的位置**。数据集没有题干文本,所以检索的是该知识点的
+**样例题统计信息**(题库规模 / 难度分布 / 代表题 ID)作为生成上下文,
+生成输入是 `skill_name`。
+
+链路:`知识点上下文(RAG)` → `QuestionGenerator` 生成结构化 JSON 题
+→ `Reviewer` **独立**评审(独立 prompt / 独立 LLM 调用,禁止复用生成上下文)。
+
+```
+$ UV_SYSTEM_CERTS=1 uv run python scripts/p3_demo.py --skills 1 --per-skill 9
+运行模式   : 真实 LLM(HTTP)
+知识点     : 1 个 × 9 道
+注入策略   : 每 3 道注入 1 道错答案(共注入 3 道)
+生成 / 通过/ 拦下 : 9 / 5 / 4
+拦截率     : 44.4%
+
+调用          次数     耗时(s)    token(估)
+生成器          1     17.71         607
+评审器          9     87.34        3195
+合计           10    105.05        3802
+
+评审区分:
+  注入错误检出率   : 3/3 = 100.0%(评审器独立抓回的被注入错误)
+  LLM 自身质量问题 : 1 道(未被注入却被判 fail)
+```
+
+**默认走真实 LLM**:`LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` 齐全时直接调
+真实 OpenAI 兼容接口(统计里 token > 0 且耗时 > 0)。三者缺失才回退到**离线确定性
+引擎**(FakeLLM),并打印明确警告「当前未调用真实 LLM」。
+
+> ⚠️ 真实链路必须带浏览器 `User-Agent`:`HttpLLM` 默认发送
+> `Mozilla/5.0 (compatible; question-recommender/0.1)` —— urllib 默认 UA
+> (`Python-urllib/3.x`)会被 `api.commandcode.ai` 的 WAF 拦成 **HTTP 403**。
+
+**注入错误与生成解耦**:先生成,再由 demo 按 `--inject-every E`(默认 3)周期性把
+某题的 `answer` 改成 `options` 里的另一个值(真正的错误答案),并记录注入清单。评审器
+独立重算,报告把 **注入错误检出率**(检测召回)与 **LLM 自身质量问题**(未被注入却被判
+fail)分开统计,拦截样例 ≥ 3 条,写入 `p3_rejected_examples.json`(**真实 LLM 生成**)。
+
+- CLI 规模:`--skills K --per-skill N`(默认 `1 × 9`)。
+- 结构化输出:所有 LLM 返回一律 `json.loads` 解析,失败重试、最终抛错,不静默吞掉。
+- 生成器 / 评审器各自持有独立 LLM 客户端,可分别注入 fake 便于测试。
+
 ## 目录
 
 ```
@@ -91,10 +135,13 @@ src/baselines.py    四个预测型 baseline
 src/bkt.py          贝叶斯知识追踪(每知识点 EM 拟合 L0/T/G/S)
 src/recommender.py  题目池 + 4 个推荐策略
 src/simulator.py    离线模拟学习者(带局限声明)
+src/llm_client.py   LLM 薄封装(HttpLLM / FakeLLM,耗时 + token 估算)
+src/question_gen.py 知识点上下文(RAG)+ 变式题生成
+src/reviewer.py     独立评审 agent
 scripts/            可执行脚本
 tests/              pytest
 ```
 
 ## 测试
 
-`uv run pytest -q` → **38 passed**
+`uv run pytest -q` → **72 passed**(原 38 + P3 新增 27 + P3-FIX 新增 7)

@@ -1,0 +1,132 @@
+[
+  {
+    "index": 0,
+    "question": {
+      "stem": "解方程：x + 9 = 15",
+      "options": [
+        "5",
+        "6",
+        "7",
+        "24"
+      ],
+      "answer": "6",
+      "skill_name": "Equation Solving Two or Fewer Steps",
+      "difficulty_hint": 0.85
+    },
+    "review": {
+      "verdict": "fail",
+      "reasons": [
+        "标注答案正确，题干无歧义，且考察 Equation Solving Two or Fewer Steps。",
+        "但 x + 9 = 15 是极简单的一步方程，难度提示 0.85（若表示通常的难度分数，越高越难）明显不合理，与该知识点平均正确率 mean=0.70 及题目实际难度不相符。"
+      ],
+      "checks": {
+        "answer_correct": true,
+        "unambiguous": true,
+        "difficulty_plausible": false,
+        "skill_aligned": true
+      }
+    },
+    "injected": false,
+    "injection": null
+  },
+  {
+    "index": 1,
+    "question": {
+      "stem": "解方程：4x = 28",
+      "options": [
+        "7",
+        "24",
+        "32",
+        "4"
+      ],
+      "answer": "7",
+      "skill_name": "Equation Solving Two or Fewer Steps",
+      "difficulty_hint": 0.9
+    },
+    "review": {
+      "verdict": "fail",
+      "reasons": [
+        "答案 7 正确，选项唯一，且题目属于一步方程，符合知识点。",
+        "难度提示 0.9 对于 4x=28 这类一步方程过高，与该知识点平均正确率约 0.70 的分布不符。"
+      ],
+      "checks": {
+        "answer_correct": true,
+        "unambiguous": true,
+        "difficulty_plausible": false,
+        "skill_aligned": true
+      }
+    },
+    "injected": false,
+    "injection": null
+  },
+  {
+    "index": 2,
+    "question": {
+      "stem": "解方程：2x + 5 = 17",
+      "options": [
+        "6",
+        "11",
+        "12",
+        "22"
+      ],
+      "answer": "11",
+      "skill_name": "Equation Solving Two or Fewer Steps",
+      "difficulty_hint": 0.72
+    },
+    "review": {
+      "verdict": "fail",
+      "reasons": [
+        "标注答案错误：解方程 2x + 5 = 17 得 2x = 12，x = 6，正确答案应为 6，而不是 11。"
+      ],
+      "checks": {
+        "answer_correct": false,
+        "unambiguous": true,
+        "difficulty_plausible": true,
+        "skill_aligned": true
+      }
+    },
+    "injected": true,
+    "injection": {
+      "index": 2,
+      "skill_name": "Equation Solving Two or Fewer Steps",
+      "stem": "解方程：2x + 5 = 17",
+      "original_answer": "6",
+      "injected_answer": "11"
+    }
+  },
+  {
+    "index": 5,
+    "question": {
+      "stem": "解方程：3(x - 2) = 15",
+      "options": [
+        "7",
+        "5",
+        "17",
+        "3"
+      ],
+      "answer": "5",
+      "skill_name": "Equation Solving Two or Fewer Steps",
+      "difficulty_hint": 0.7
+    },
+    "review": {
+      "verdict": "fail",
+      "reasons": [
+        "标注答案为5，但正确解为x=7；5是x-2的值，不是x的值。"
+      ],
+      "checks": {
+        "answer_correct": false,
+        "unambiguous": true,
+        "difficulty_plausible": true,
+        "skill_aligned": true
+      }
+    },
+    "injected": true,
+    "injection": {
+      "index": 5,
+      "skill_name": "Equation Solving Two or Fewer Steps",
+      "stem": "解方程：3(x - 2) = 15",
+      "original_answer": "7",
+      "injected_answer": "5"
+    }
+  }
+]
