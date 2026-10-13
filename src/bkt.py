@@ -115,6 +115,17 @@ def fit_skill(
     return params
 
 
+def update_mastery(p_m: float, obs: int, prm: BKTParams) -> float:
+    """BKT 在线一步:观测 → 后验 → 学习转移。返回更新后的掌握概率。"""
+    if obs == 1:
+        denom = p_m * (1 - prm.s) + (1 - p_m) * prm.g
+        post = (p_m * (1 - prm.s)) / denom if denom > EPS else p_m
+    else:
+        denom = p_m * prm.s + (1 - p_m) * (1 - prm.g)
+        post = (p_m * prm.s) / denom if denom > EPS else p_m
+    return post + (1 - post) * prm.t
+
+
 class BKT:
     """每个知识点一套参数的 BKT。"""
 

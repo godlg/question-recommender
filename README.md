@@ -2,7 +2,8 @@
 
 个性化推荐题目的 Agent(实习面试项目):用**知识追踪**估计学生能力 → 卡在**最近发展区**选题 → 推荐。
 
-> P0(评测骨架)✅ · P1(能力估计 BKT)✅ — BKT AUC **0.7298**,打赢最强 baseline(0.6690)。
+> P0(评测骨架)✅ · P1(能力估计 BKT,AUC 0.7298)✅ · P2(推荐链路 + 离线对照)✅
+> **增益推把平均掌握度从 0.6362(随机)提到 0.6918。**
 
 ## 冷启动(第一次跑)
 
@@ -14,8 +15,9 @@ uv sync
 UV_SYSTEM_CERTS=1 uv run --python 3.13 --with EduData \
   python -c "from EduData import get_data; get_data('assistment-2009-2010-skill','data/')"
 
-# 3. 跑 baseline + BKT 对比表
-UV_SYSTEM_CERTS=1 uv run python scripts/eval_bkt.py
+# 3. 跑对比表
+UV_SYSTEM_CERTS=1 uv run python scripts/eval_bkt.py          # 能力估计:4 baseline + BKT
+UV_SYSTEM_CERTS=1 uv run python scripts/eval_recommend.py    # 推荐:4 策略离线对比
 
 # 4. 测试
 uv run pytest -q
@@ -40,40 +42,59 @@ uv run pytest -q
 
 ## 划分
 
-**每个学生按时间切**(`split_by_student_time`):前 80% 进 train、后 20% 进 test;交互数 < 10 的学生全留 train。
-这是 KT / 推荐的任务定义(用学生历史预测其后续),也是「按学生历史」baseline 有意义的前提。
+**每个学生按时间切**(`split_by_student_time`):前 80% train / 后 20% test;交互数 < 10 的学生全留 train。
+另提供 `split_by_student`(整学生切走)作**冷启动对照**——此时 test 学生在 train 中不出现,所有「用学生信息」的 baseline 退化为全局先验(实测 AUC=0.5000)。
 
-另提供 `split_by_student`(整学生切走)作**冷启动对照**:此时 test 学生在 train 中不出现,所有「用学生信息」的 baseline 退化为全局先验(实测 AUC=0.5000)。
-
-## 实测结果(2026-10-12)
+## P1:能力估计实测(2026-10-12)
 
 ```
-train/test : 272,590 / 65,411 行(每生前 80% / 后 20%)
-知识点     : 123(已拟合 117)
+train/test : 272,590 / 65,411 行;知识点 123(已拟合 117)
 
 model        AUC      ACC
----------------------------
 全局正确率   0.5000   0.6439
 按知识点     0.6281   0.6561
 按学生历史   0.6690   0.6788
 随机         0.4985   0.5030
-BKT          0.7298   0.7132   ← P1 目标 >0.6690 达成
+BKT          0.7298   0.7132   ← 打赢最强 baseline +0.061
 ```
 
-BKT 比最强 baseline 高 **+0.061 AUC**。
+## P2:推荐策略离线对比(2026-10-12)
+
+⚠️ **这是离线模拟评估**:模拟学习者与推荐策略共用同一套 BKT 参数,存在「自己评自己」的偏差。
+它衡量策略在学习者模型下的**相对优劣**,不是真实教学效果(真实效果需线上 A/B)。
+
+```
+模拟 200 名学生 × 20 轮(每轮推 1 道没做过的题)
+
+策略              全体掌握度  薄弱掌握度  累计准确率
+随机推            0.6362     0.6182     0.4730
+顺序推            0.6625     0.6432     0.5107
+ZPD推(难度匹配)   0.6260     0.6077     0.5502
+增益推(期望增益)  0.6918     0.6843     0.4367   ← 最优
+```
+
+**关键洞察**:增益推答对率最低(0.437)但掌握度最高——它不挑简单题讨好学生,而是在**最该学的地方**投入。只看答对率会误判策略。
+
+策略定义:
+- `随机推` 从候选中随机取(对照)
+- `顺序推` 按 problem_id 升序(对照)
+- `ZPD推` 挑预测正确率最接近 0.7 的题 —— **朴素实现会跑偏**:它被"已经中等掌握"的题吸引,绕开真正薄弱的知识点
+- `增益推` **最大化期望掌握度增益** `E[Δm] = p(对)·Δm(对) + p(错)·Δm(错)` —— 把「该练什么」形式化
 
 ## 目录
 
 ```
-src/data.py       加载 + 清洗 + 统一 schema
-src/split.py      按学生时间切分(主) / 整学生切分(冷启动对照)
-src/metrics.py    AUC / ACC / Recall@k
-src/baselines.py  四个预测型 baseline
-src/bkt.py        贝叶斯知识追踪(每知识点 EM 拟合 L0/T/G/S)
-scripts/          可执行脚本
-tests/            pytest
+src/data.py         加载 + 清洗 + 统一 schema
+src/split.py        按学生时间切分(主) / 整学生切分(冷启动对照)
+src/metrics.py      AUC / ACC / Recall@k
+src/baselines.py    四个预测型 baseline
+src/bkt.py          贝叶斯知识追踪(每知识点 EM 拟合 L0/T/G/S)
+src/recommender.py  题目池 + 4 个推荐策略
+src/simulator.py    离线模拟学习者(带局限声明)
+scripts/            可执行脚本
+tests/              pytest
 ```
 
 ## 测试
 
-`uv run pytest -q` → **28 passed**
+`uv run pytest -q` → **38 passed**
