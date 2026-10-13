@@ -14,6 +14,8 @@ import app as appmod
 from app import AppState, app, set_state
 from src.bkt import BKTParams
 from src.data import KEEP_COLS
+from src.llm_client import FakeLLM
+from src.question_gen import QuestionGenerator
 from src.recommender import QuestionPool
 
 
@@ -191,3 +193,101 @@ def test_build_state_fast_mode(monkeypatch):
     assert len(st.params) > 0
     assert len(st.student_ids) > 0
     assert len(st.pool.problem_id) > 0
+
+
+def _chinese_json(prompt: str) -> str:
+    """按题目要求的 JSON 结构返回一道全中文题(含 4 选项)。"""
+    import json
+
+    return json.dumps(
+        [
+            {
+                "stem": "计算下列各式的值:求长方形的周长。",
+                "options": ["选项甲", "选项乙", "选项丙", "选项丁"],
+                "answer": "选项甲",
+                "skill_name": "周长",
+                "difficulty_hint": 0.5,
+            }
+        ],
+        ensure_ascii=False,
+    )
+
+
+def _with_generator(responder) -> tuple[AppState, FakeLLM]:
+    st = _state()
+    fake = FakeLLM(responder)
+    st.generator = QuestionGenerator(fake)
+    set_state(st)
+    return st, fake
+
+
+def _has_cjk(s: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in s)
+
+
+def test_recommend_with_text_returns_chinese(client):
+    """with_text=1 时每道题都带中文 text.stem。"""
+    _, _ = _with_generator(_chinese_json)
+    recs = TestClient(app).get(
+        "/api/students/1/recommend?k=5&with_text=1"
+    ).json()["recommendations"]
+    assert recs
+    for rec in recs:
+        assert rec["text"] is not None
+        assert _has_cjk(rec["text"]["stem"])
+        assert len(rec["text"]["options"]) == 4
+        assert rec["text"]["answer"] in rec["text"]["options"]
+
+
+def test_recommend_with_text_zero_skips_llm(client):
+    """with_text=0 时 text 全为 null 且未调用 LLM。"""
+    _, fake = _with_generator(_chinese_json)
+    recs = TestClient(app).get(
+        "/api/students/1/recommend?k=5&with_text=0"
+    ).json()["recommendations"]
+    assert recs
+    assert all(rec["text"] is None for rec in recs)
+    assert fake.calls == []
+
+
+def test_recommend_text_cache_hit(client):
+    """同一 problem_id 第二次请求不再增加 LLM 调用次数。"""
+    _, fake = _with_generator(_chinese_json)
+    c = TestClient(app)
+    first = c.get("/api/students/1/recommend?k=5&with_text=1").json()[
+        "recommendations"
+    ]
+    calls_after_first = len(fake.calls)
+    assert calls_after_first == len(first)
+
+    second = c.get("/api/students/1/recommend?k=5&with_text=1").json()[
+        "recommendations"
+    ]
+    assert len(fake.calls) == calls_after_first
+    assert [r["text"] for r in second] == [r["text"] for r in first]
+
+
+def test_recommend_llm_failure_degrades_gracefully(client):
+    """LLM 抛错时接口仍返回 200 且 text 为 null。"""
+
+    def boom(_prompt: str) -> str:
+        raise RuntimeError("LLM 挂了")
+
+    _with_generator(boom)
+    r = TestClient(app).get("/api/students/1/recommend?k=5&with_text=1")
+    assert r.status_code == 200
+    recs = r.json()["recommendations"]
+    assert recs
+    assert all(rec["text"] is None for rec in recs)
+
+
+def test_recommend_without_llm_config_returns_null(client, monkeypatch):
+    """env 缺失(无注入 generator)时不得报错,text 全为 null。"""
+    for key in ("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    st = _state()
+    assert st.generator is None
+    set_state(st)
+    r = TestClient(app).get("/api/students/1/recommend?k=5&with_text=1")
+    assert r.status_code == 200
+    assert all(rec["text"] is None for rec in r.json()["recommendations"])

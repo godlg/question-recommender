@@ -87,7 +87,7 @@
   .cell .val { font-weight: 600; font-size: 13px; }
   .rec {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 10px;
     padding: 10px 12px;
     border: 1px solid var(--line);
@@ -98,6 +98,13 @@
   .rec .info { flex: 1; min-width: 0; }
   .rec .pid { font-weight: 600; font-size: 14px; }
   .rec .sk { color: var(--muted); font-size: 12px; }
+  .rec .stem { font-size: 14px; line-height: 1.5; margin: 6px 0; }
+  .rec .options { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+  .rec .options li { padding: 2px 0; color: var(--muted); }
+  .rec .options li.answer { color: var(--ok); font-weight: 600; }
+  .rec .placeholder { color: var(--muted); font-size: 13px; font-style: italic; }
+  .rec .loading { color: var(--muted); font-size: 13px; }
+  .rec .actions { display: flex; flex-direction: column; gap: 6px; }
   .rec button {
     border: none;
     border-radius: 6px;
@@ -190,6 +197,26 @@ function renderState(payload) {
   }
 }
 
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
+function renderText(text) {
+  if (!text) {
+    return '<div class="placeholder">题面不可用</div>';
+  }
+  const opts = text.options
+    .map((o) => {
+      const cls = o === text.answer ? "answer" : "";
+      return `<li class="${cls}">${esc(o)}</li>`;
+    })
+    .join("");
+  return `<div class="stem">${esc(text.stem)}</div>` +
+    `<ul class="options">${opts}</ul>`;
+}
+
 function renderRecs(recs) {
   const box = $("recs");
   box.innerHTML = "";
@@ -203,8 +230,11 @@ function renderRecs(recs) {
     el.innerHTML =
       `<div class="info">
          <div class="pid">题目 #${r.problem_id}</div>
-         <div class="sk">${r.skill_name} · 难度 ${r.difficulty.toFixed(2)}</div>
+         <div class="sk">${esc(r.skill_name)} · 难度 ${r.difficulty.toFixed(2)}</div>
+         ${renderText(r.text)}
        </div>`;
+    const actions = document.createElement("div");
+    actions.className = "actions";
     const ok = document.createElement("button");
     ok.className = "ok";
     ok.textContent = "答对";
@@ -213,8 +243,9 @@ function renderRecs(recs) {
     bad.className = "bad";
     bad.textContent = "答错";
     bad.onclick = () => submitAnswer(r.problem_id, false, el);
-    el.appendChild(ok);
-    el.appendChild(bad);
+    actions.appendChild(ok);
+    actions.appendChild(bad);
+    el.appendChild(actions);
     box.appendChild(el);
   }
 }
@@ -243,7 +274,9 @@ async function loadState() {
 }
 
 async function loadRecs() {
-  const resp = await fetch(`/api/students/${S.uid}/recommend?k=5`);
+  $("recs").innerHTML =
+    '<p class="loading">正在生成中文题面…(首次较慢)</p>';
+  const resp = await fetch(`/api/students/${S.uid}/recommend?k=5&with_text=1`);
   const data = await resp.json();
   renderRecs(data.recommendations);
 }

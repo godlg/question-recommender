@@ -7,7 +7,8 @@
     GET  /                          → web/index.html
     GET  /api/students?limit=20     → 抽样学生
     GET  /api/students/{uid}/state  → 每个知识点掌握度 + 概览
-    GET  /api/students/{uid}/recommend?k=5 → 用 GainStrategy 推荐 k 道题
+    GET  /api/students/{uid}/recommend?k=5&with_text=1 → 用 GainStrategy 推荐 k 道题,
+        并用 LLM 现场生成中文题面(text 字段,进程内按 problem_id 缓存)
     POST /api/students/{uid}/answer → 作答 → 更新掌握度 → 返回新 state + 新推荐
 
 学生「当前掌握度」= 用其历史记录逐条 update_mastery 递推得到。
@@ -28,6 +29,8 @@ from pydantic import BaseModel
 
 from src.bkt import BKT, BKTParams, update_mastery
 from src.data import ENCODING, find_raw, load_clean
+from src.llm_client import HttpLLM, LLMConfigError
+from src.question_gen import QuestionGenerator, parse_questions
 from src.recommender import GainStrategy, Params, QuestionPool, State
 from src.split import split_by_student_time
 
@@ -52,6 +55,13 @@ class AppState:
     history: dict[int, list[tuple[int, int]]]  # uid → [(skill_id, correct)]
     student_ids: list[int]
     mastery: dict[int, State] = field(default_factory=dict)
+    # 进程内缓存:problem_id → {"stem","options","answer"},同一题只生成一次
+    text_cache: dict[int, dict] = field(default_factory=dict)
+    generator: QuestionGenerator | None = None
+    generator_unavailable: bool = False
+
+    def text_of(self, pid: int) -> dict | None:
+        return self.text_cache.get(int(pid))
 
     def state_of(self, uid: int) -> State:
         if uid not in self.mastery:
@@ -159,6 +169,76 @@ def set_state(state: AppState) -> None:
     _STATE = state
 
 
+def _difficulty_label(difficulty: float) -> str:
+    if difficulty >= 0.7:
+        return "偏易"
+    if difficulty >= 0.45:
+        return "中等"
+    return "偏难"
+
+
+def build_text_prompt(skill_name: str, difficulty: float) -> str:
+    """让 LLM 现场生成一道中文题面(4 选项 + 答案),输出结构化 JSON。"""
+    schema = (
+        '{"stem": "题干", "options": ["A", "B", "C", "D"], '
+        '"answer": "正确选项(必须是 options 之一)", "skill_name": "'
+        + skill_name
+        + '", "difficulty_hint": 0.0}'
+    )
+    return (
+        "你是一名中文出题专家。请依据下面的知识点与难度要求,"
+        "命制 1 道同知识点的中文变式题。\n\n"
+        f"【知识点】{skill_name}\n"
+        f"【难度提示】{difficulty:.2f}(0 最难、1 最易,{_difficulty_label(difficulty)})\n\n"
+        "【输出要求】只输出一个 JSON 数组,每个元素形如:\n"
+        f"{schema}\n"
+        "题干与选项必须使用简体中文;difficulty_hint 是 0~1 的难度提示;"
+        "answer 必须精确等于 options 中的某一项。不要输出任何解释文字。"
+    )
+
+
+def _ensure_generator(st: AppState) -> QuestionGenerator | None:
+    """惰性建 LLM 生成器;env 缺失时标记不可用并返回 None(不抛错)。"""
+    if st.generator is not None:
+        return st.generator
+    if st.generator_unavailable:
+        return None
+    try:
+        st.generator = QuestionGenerator(HttpLLM())
+    except LLMConfigError:
+        st.generator_unavailable = True
+        return None
+    return st.generator
+
+
+def _text_for(
+    st: AppState, pid: int, sid: int, difficulty: float, generate: bool
+) -> dict | None:
+    """取(必要时生成)某题的中文题面。任何失败都返回 None,绝不抛错。"""
+    cached = st.text_of(pid)
+    if cached is not None:
+        return cached
+    if not generate:
+        return None
+    gen = _ensure_generator(st)
+    if gen is None:
+        return None
+    skill_name = st.skill_names.get(int(sid), f"skill_{int(sid)}")
+    try:
+        questions = parse_questions(
+            gen.llm.complete(build_text_prompt(skill_name, difficulty)).text,
+            skill_name,
+        )
+    except Exception:  # noqa: BLE001 - LLM/解析任何失败都降级为无题面
+        return None
+    if not questions:
+        return None
+    q = questions[0]
+    text = {"stem": q["stem"], "options": list(q["options"]), "answer": q["answer"]}
+    st.text_cache[int(pid)] = text
+    return text
+
+
 class AnswerIn(BaseModel):
     problem_id: int
     correct: bool
@@ -188,7 +268,9 @@ def _state_payload(st: AppState, uid: int) -> dict:
     return {"user_id": uid, "skills": rows, "overview": _overview(mastery)}
 
 
-def _recommend_payload(st: AppState, uid: int, k: int) -> list[dict]:
+def _recommend_payload(
+    st: AppState, uid: int, k: int, with_text: bool = True
+) -> list[dict]:
     mastery = st.ensure_state(uid)
     known_skills = [s for s in mastery if s in st.params]
     candidates = st.pool.problems_of(known_skills)
@@ -206,14 +288,16 @@ def _recommend_payload(st: AppState, uid: int, k: int) -> list[dict]:
     out = []
     for pid in pids:
         sid = st.pool.skill_lookup[int(pid)]
+        difficulty = float(st.pool.difficulty[
+            np.where(st.pool.problem_id == int(pid))[0][0]
+        ])
         out.append(
             {
                 "problem_id": int(pid),
                 "skill_id": int(sid),
                 "skill_name": st.skill_names.get(int(sid), f"skill_{int(sid)}"),
-                "difficulty": float(st.pool.difficulty[
-                    np.where(st.pool.problem_id == int(pid))[0][0]
-                ]),
+                "difficulty": difficulty,
+                "text": _text_for(st, int(pid), int(sid), difficulty, with_text),
             }
         )
     return out
@@ -243,11 +327,18 @@ def student_state(uid: int) -> dict:
 
 
 @app.get("/api/students/{uid}/recommend")
-def recommend(uid: int, k: int = Query(5, ge=1, le=50)) -> dict:
+def recommend(
+    uid: int,
+    k: int = Query(5, ge=1, le=50),
+    with_text: int = Query(1),
+) -> dict:
     st = get_state()
     if uid not in st.student_ids and uid not in st.history:
         raise HTTPException(status_code=404, detail=f"学生 {uid} 不存在")
-    return {"user_id": uid, "recommendations": _recommend_payload(st, uid, k)}
+    return {
+        "user_id": uid,
+        "recommendations": _recommend_payload(st, uid, k, with_text=bool(with_text)),
+    }
 
 
 @app.post("/api/students/{uid}/answer")
