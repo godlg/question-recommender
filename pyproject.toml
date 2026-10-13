@@ -1,0 +1,17 @@
+[project]
+name = "question-recommender"
+version = "0.1.0"
+description = "个性化推荐题目 - 实习面试项目"
+requires-python = ">=3.13"
+dependencies = [
+    "pandas>=2.2",
+    "numpy>=2.0",
+    "scikit-learn>=1.5",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
