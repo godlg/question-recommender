@@ -255,9 +255,10 @@ function renderState(payload) {
     const c = document.createElement("div");
     c.className = "cell";
     c.style.background = masteryColor(s.mastery);
+    const na = s.n_answers ?? 0;
     c.innerHTML =
       `<span class="name" title="${s.skill_name}">${s.skill_name}</span>` +
-      `<span class="val">${s.mastery.toFixed(2)}</span>` +
+      `<span class="val">${s.mastery.toFixed(2)} · 已测${na}次</span>` +
       `<div class="bar"><span style="width:${(s.mastery * 100).toFixed(0)}%;background:rgba(255,255,255,.85)"></span></div>`;
     hm.appendChild(c);
   }

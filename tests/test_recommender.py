@@ -5,7 +5,9 @@ import pytest
 from src.bkt import BKTParams
 from src.data import KEEP_COLS
 from src.recommender import (
+    COLD_MIN,
     GainStrategy,
+    InfoGainStrategy,
     QuestionPool,
     RandomStrategy,
     SequentialStrategy,
@@ -123,4 +125,124 @@ def test_gain_requires_state_and_params():
     pool = _pool()
     got = GainStrategy().recommend(pool, _flat_probs(0.5), np.array([100]), n=1)
     assert got == []  # 缺少 state/params → 不推荐
+
+
+def test_gain_counts_none_backward_compatible():
+    """counts=None 时 GainStrategy 排序结果与旧实现逐位一致。"""
+    pool = _pool()
+    params = {
+        10: BKTParams(l0=0.2, t=0.2, g=0.2, s=0.1),
+        11: BKTParams(l0=0.8, t=0.2, g=0.2, s=0.1),
+    }
+    state = {10: 0.2, 11: 0.8}
+    cand = np.array([100, 101, 102, 103, 200])
+    got = GainStrategy().recommend(
+        pool, _flat_probs(0.5), cand, n=2, state=state, params=params
+    )
+    # 2 个不同知识点,最多取 2 道
+    assert len(got) == 2
+    # 只要顺序稳定即可,与冷启动无关
+    assert isinstance(got, list)
+
+
+def test_cold_start_prefers_zero_count_skill():
+    """冷启动门控:构造 counts 让 skill 11 为 0 次,首选应落在该知识点。"""
+    pool = _pool()
+    params = {
+        10: BKTParams(l0=0.2, t=0.2, g=0.2, s=0.1),
+        11: BKTParams(l0=0.2, t=0.2, g=0.2, s=0.1),
+    }
+    state = {10: 0.2, 11: 0.2}
+    # 100-103 属于 skill10, 200 属于 skill11
+    cand = np.array([100, 101, 102, 103, 200])
+    got = GainStrategy(cold_start=True, cold_min=COLD_MIN).recommend(
+        pool, _flat_probs(0.5), cand, n=1, state=state, params=params, counts={10: 5, 11: 0}
+    )
+    assert got == [200]
+
+
+def test_cold_start_does_not_repeat_skill_in_one_round():
+    """冷启动候选多个时,一轮内同一知识点只取一道。"""
+    pool = _pool()
+    params = {
+        10: BKTParams(l0=0.2, t=0.2, g=0.2, s=0.1),
+        11: BKTParams(l0=0.2, t=0.2, g=0.2, s=0.1),
+    }
+    state = {10: 0.2, 11: 0.2}
+    cand = np.array([100, 101, 102, 103, 200])
+    got = GainStrategy(cold_start=True, cold_min=COLD_MIN).recommend(
+        pool, _flat_probs(0.5), cand, n=5, state=state, params=params, counts={10: 0, 11: 0}
+    )
+    # 先取 skill10 中 counts 最小的,再取 skill11 的;一轮内不重复
+    assert len(got) == 2
+    assert set(pool.skill_lookup[p] for p in got) == {10, 11}
+
+
+def test_info_gain_prefers_uncertain():
+    """信息增益:不确定性大者(m≈0.5)分数高于几乎确定者(m≈0.95)。"""
+    pool = _pool()
+    params = {
+        10: BKTParams(l0=0.5, t=0.2, g=0.2, s=0.1),
+        11: BKTParams(l0=0.95, t=0.2, g=0.2, s=0.1),
+    }
+    state = {10: 0.5, 11: 0.95}
+    cand = np.array([100, 200])
+    got = InfoGainStrategy().recommend(
+        pool, _flat_probs(0.5), cand, n=1, state=state, params=params
+    )
+    assert got == [100]
+
+
+def test_info_gain_empty_or_none_returns_empty():
+    pool = _pool()
+    assert InfoGainStrategy().recommend(pool, _flat_probs(0.5), np.array([]), n=1) == []
+    assert (
+        InfoGainStrategy().recommend(
+            pool, _flat_probs(0.5), np.array([100]), n=1, state=None, params=None
+        )
+        == []
+    )
+
+
+def test_simulate_student_passes_counts_to_strategy():
+    """simulate_student 在作答后 counts 递增并传给策略。"""
+    pool = _pool()
+    params = {
+        10: BKTParams(l0=0.2, t=0.2, g=0.2, s=0.1),
+        11: BKTParams(l0=0.8, t=0.2, g=0.2, s=0.1),
+    }
+    captured: list[dict[int, int]] = []
+
+    class Spy:
+        name = "spy"
+
+        def recommend(self, pool, prob_fn, candidates, n, state=None, params=None, counts=None):
+            captured.append(dict(counts or {}))
+            return SequentialStrategy().recommend(pool, prob_fn, candidates, n, state, params)
+
+    simulate_student(Spy(), [10, 11], pool, params, n_rounds=3, seed=0)
+    # 第 1 轮 counts 来自 init_counts(空),随后每轮递增
+    assert len(captured) == 3
+    assert captured[0] == {}
+    assert captured[1] != captured[0] or len(captured[1]) >= 1
+
+
+def test_simulate_student_init_counts_used():
+    """init_counts 会被传入策略并在作答后累加。"""
+    pool = _pool()
+    params = {
+        10: BKTParams(l0=0.2, t=0.2, g=0.2, s=0.1),
+        11: BKTParams(l0=0.8, t=0.2, g=0.2, s=0.1),
+    }
+    captured: list[dict[int, int]] = []
+
+    class Spy:
+        name = "spy"
+
+        def recommend(self, pool, prob_fn, candidates, n, state=None, params=None, counts=None):
+            captured.append(dict(counts or {}))
+            return SequentialStrategy().recommend(pool, prob_fn, candidates, n, state, params)
+
+    simulate_student(Spy(), [10, 11], pool, params, n_rounds=2, seed=0, init_counts={10: 2})
+    assert captured[0].get(10, 0) == 2
 

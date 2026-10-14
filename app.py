@@ -77,6 +77,8 @@ class AppState:
     # P7:embedding 检索(默认 None → 全程 keyword,行为与 P6 一致)
     embedder: Embedder | None = None
     retrieval_mode: str = "keyword"  # 实际生效模式(embedder 缺失时已降级)
+    # P8:该生在各知识点的作答次数(uid → skill_id → count),与 history 解耦
+    n_answers: dict[int, dict[int, int]] = field(default_factory=dict)
 
     def material_store(self) -> MaterialStore:
         if self.materials is None:
@@ -316,14 +318,26 @@ def _overview(mastery: State) -> dict:
     }
 
 
+def _counts_of(st: AppState, uid: int) -> dict[int, int]:
+    """合并数据集中学生的真实历史计数 + 新建学生的在线作答计数。"""
+    counts: dict[int, int] = {}
+    for sid, _ in st.history.get(uid, []):
+        counts[sid] = counts.get(sid, 0) + 1
+    for sid, c in st.n_answers.get(uid, {}).items():
+        counts[sid] = counts.get(sid, 0) + c
+    return counts
+
+
 def _state_payload(st: AppState, uid: int) -> dict:
     mastery = st.ensure_state(uid)
     names = st.active_skill_names()
+    counts = _counts_of(st, uid)
     rows = [
         {
             "skill_id": int(sid),
             "skill_name": names.get(int(sid), f"skill_{int(sid)}"),
             "mastery": float(m),
+            "n_answers": counts.get(int(sid), 0),
         }
         for sid, m in sorted(mastery.items())
     ]
@@ -403,8 +417,9 @@ def _recommend_payload(
         m = np.array([mastery.get(int(s), params[int(s)].l0) for s in skills])
         return m * (1 - s_slip) + (1 - m) * g
 
+    counts = _counts_of(st, uid)
     pids = GainStrategy().recommend(
-        pool, prob_fn, candidates, n=k, state=mastery, params=params
+        pool, prob_fn, candidates, n=k, state=mastery, params=params, counts=counts
     )
     out = []
     for pid in pids:
@@ -507,6 +522,11 @@ def answer(uid: int, body: AnswerIn) -> dict:
 
     mastery = st.ensure_state(uid)
     mastery[sid] = update_mastery(mastery.get(sid, prm.l0), int(body.correct), prm)
+
+    # P8:记录该生在该知识点的作答次数,供冷启动门控使用
+    if uid not in st.n_answers:
+        st.n_answers[uid] = {}
+    st.n_answers[uid][sid] = st.n_answers[uid].get(sid, 0) + 1
 
     return {
         "user_id": uid,

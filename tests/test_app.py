@@ -163,6 +163,33 @@ def test_answer_updates_mastery(client):
     assert after[11] != before[11]
 
 
+def test_state_includes_n_answers(client):
+    """GET /state 返回每个知识点的作答次数。"""
+    r = client.get("/api/students/1/state")
+    assert r.status_code == 200
+    for s in r.json()["skills"]:
+        assert "n_answers" in s
+        assert isinstance(s["n_answers"], int)
+
+
+def test_answer_increments_n_answers(client):
+    """POST /answer 后该知识点 n_answers 递增。"""
+    # 学生 1 在 skill 11 上已有 1 次历史(test fixture)
+    r = client.post("/api/students/1/answer", json={"problem_id": 200, "correct": True})
+    assert r.status_code == 200
+    skills = {s["skill_id"]: s["n_answers"] for s in r.json()["state"]["skills"]}
+    assert skills[11] == 2
+
+
+def test_new_student_starts_with_zero_n_answers(client):
+    """新建学生所有知识点 n_answers 为 0。"""
+    r = client.post("/api/students", json={})
+    assert r.status_code == 200
+    uid = r.json()["user_id"]
+    state = client.get(f"/api/students/{uid}/state").json()
+    assert all(s["n_answers"] == 0 for s in state["skills"])
+
+
 def test_answer_returns_new_recommendations(client):
     r = client.post("/api/students/1/answer", json={"problem_id": 100, "correct": True})
     assert r.status_code == 200

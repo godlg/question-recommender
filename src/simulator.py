@@ -51,6 +51,7 @@ def simulate_student(
     params: Params,
     n_rounds: int = 20,
     seed: int = 0,
+    init_counts: dict[int, int] | None = None,
 ) -> SimResult:
     """一个学生:每轮推荐 1 道**没做过的**题 → 按 BKT 采样作答 → 在线更新掌握度。"""
     skills = [s for s in student_skills if s in params]
@@ -65,13 +66,20 @@ def simulate_student(
     n_correct = 0
     done = 0
     used: set[int] = set()
+    counts: dict[int, int] = dict(init_counts or {})
 
     for _ in range(n_rounds):
         avail = candidates if not used else candidates[~np.isin(candidates, list(used))]
         if len(avail) == 0:
             break
         pids = strategy.recommend(
-            pool, _prob_fn(state, params, pool), avail, n=1, state=state, params=params
+            pool,
+            _prob_fn(state, params, pool),
+            avail,
+            n=1,
+            state=state,
+            params=params,
+            counts=counts,
         )
         if not pids:
             break
@@ -87,6 +95,7 @@ def simulate_student(
         n_correct += obs
         done += 1
         state[sid] = update_mastery(p_m, obs, prm)
+        counts[sid] = counts.get(sid, 0) + 1
 
     final = float(np.mean(list(state.values())))
     weak_final = float(np.mean([state[s] for s in weak]))
